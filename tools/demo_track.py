@@ -14,6 +14,144 @@ from yolox.utils.visualize import plot_tracking
 from yolox.tracker.byte_tracker import BYTETracker
 from yolox.tracking_utils.timer import Timer
 
+import cv2
+from flask import Flask, render_template, Response, request
+from io import BytesIO
+from PIL import Image
+
+
+app = Flask(
+    __name__,
+    static_url_path='', 
+    static_folder='./',
+    template_folder='./',
+)
+
+def resize_img_2_bytes(image, resize_factor, quality):
+    bytes_io = BytesIO()
+    img = Image.fromarray(image)
+    w, h = img.size
+    img.thumbnail((int(w * resize_factor), int(h * resize_factor)))
+    img.save(bytes_io, 'jpeg', quality=quality)
+
+    return bytes_io.getvalue()
+
+@app.route("/", methods=['GET'])
+def get_stream_html():
+    return render_template('stream.html')
+
+banned_id_list = []
+@app.route('/handle_click', methods=['POST'])
+def handle_click():
+    data = request.get_json()
+    x = data['x']
+    y = data['y']
+    # find the closest box
+    min_dist = 999999999
+    min_id = -1
+    for i, tlwh in enumerate(glo_tlws):
+        print(tlwh)
+        middle_x = tlwh[0] + tlwh[2] // 2
+        middle_y = tlwh[1] + tlwh[3] // 2
+        x_diff = abs(middle_x - x)
+        if x_diff > tlwh[2] / 2:
+            continue
+        y_diff = abs(middle_y - y)
+        if y_diff > tlwh[3] / 2:
+            continue
+        dist = x_diff * x_diff + y_diff * y_diff
+        if dist < min_dist:
+            min_dist = dist
+            min_id = glo_ids[i]
+    if min_id != -1:
+        # if in banned list, remove it
+        if min_id in banned_id_list:
+            banned_id_list.remove(min_id)
+        else:
+            banned_id_list.append(min_id)
+    return {'x': x, 'y': y}
+
+glo_exp = None
+glo_args = None
+glo_predictor = None
+glo_tracker = None
+glo_frame_id = 0
+glo_cap = cv2.VideoCapture(1)
+glo_cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+glo_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+glo_cap.set(cv2.CAP_PROP_FPS, 30)
+glo_timer = Timer()
+glo_results = []
+glo_tlws = []
+glo_ids = []
+def init_model_related_work(exp, args):
+    global glo_exp, glo_args, glo_predictor, glo_tracker
+    glo_exp = exp
+    glo_args = args
+    predictor, vis_folder, current_time, args = main(exp, args)
+    glo_predictor = predictor
+    glo_tracker = BYTETracker(args, frame_rate=30)
+
+    
+
+def capture():
+    global glo_frame_id, glo_cap, glo_timer, glo_results, glo_predictor, glo_tracker, glo_tlws, glo_ids
+    while True:
+        if glo_frame_id % 20 == 0:
+            logger.info('Processing frame {} ({:.2f} fps)'.format(glo_frame_id, 1. / max(1e-5, glo_timer.average_time)))
+        ret_val, frame = glo_cap.read()
+        if ret_val:
+            outputs, img_info = glo_predictor.inference(frame, glo_timer)
+            if outputs[0] is not None:
+                online_targets = glo_tracker.update(outputs[0], [img_info['height'], img_info['width']], glo_exp.test_size)
+                online_tlwhs = []
+                online_ids = []
+                online_scores = []
+                for t in online_targets:
+                    tlwh = t.tlwh
+                    tid = t.track_id
+                    vertical = tlwh[2] / tlwh[3] > glo_args.aspect_ratio_thresh
+                    if tlwh[2] * tlwh[3] > glo_args.min_box_area and not vertical:
+                        online_tlwhs.append(tlwh)
+                        online_ids.append(tid)
+                        online_scores.append(t.score)
+                        # glo_results.append(
+                        #     f"{glo_frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
+                        # )
+                
+                glo_tlws = online_tlwhs
+                glo_ids = online_ids
+                for i, tlwh in enumerate(online_tlwhs):
+                    if online_ids[i] in banned_id_list:
+                        continue
+                        # cv2.rectangle(img_info['raw_img'], (int(tlwh[0]), int(tlwh[1])), (int(tlwh[0] + tlwh[2]), int(tlwh[1] + tlwh[3])), (0, 0, 255), 2)
+                    else:
+                        cv2.rectangle(img_info['raw_img'], (int(tlwh[0]), int(tlwh[1])), (int(tlwh[0] + tlwh[2]), int(tlwh[1] + tlwh[3])), (0, 255, 0), 2)
+                    # add id text
+                    # cv2.putText(img_info['raw_img'], str(online_ids[i]), (int(tlwh[0]), int(tlwh[1])), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), thickness=2)
+            
+            online_im = img_info['raw_img']
+            img2server = cv2.cvtColor(online_im, cv2.COLOR_BGR2RGB)
+            img_bytes = resize_img_2_bytes(img2server, resize_factor=0.75, quality=75)
+            # yeaid back to client
+            yield (b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' + img_bytes + b'\r\n\r\n')
+
+            ch = cv2.waitKey(1)
+            if ch == 27 or ch == ord("q") or ch == ord("Q"):
+                break
+            glo_timer.toc()
+        else:
+            break
+        glo_frame_id += 1            
+
+
+@app.route('/api/stream')
+def video_stream():
+    return Response(capture(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+
+
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
 
@@ -208,6 +346,7 @@ def image_demo(predictor, vis_folder, current_time, args):
             online_im = plot_tracking(
                 img_info['raw_img'], online_tlwhs, online_ids, frame_id=frame_id, fps=1. / timer.average_time
             )
+            cv2.resize(online_im, (1280, 720))
         else:
             timer.toc()
             online_im = img_info['raw_img']
@@ -253,6 +392,8 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
     timer = Timer()
     frame_id = 0
     results = []
+    # id_set = set()
+    
     while True:
         if frame_id % 20 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(frame_id, 1. / max(1e-5, timer.average_time)))
@@ -271,6 +412,7 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
                     if tlwh[2] * tlwh[3] > args.min_box_area and not vertical:
                         online_tlwhs.append(tlwh)
                         online_ids.append(tid)
+                        # id_set.add(tid)
                         online_scores.append(t.score)
                         results.append(
                             f"{frame_id},{tid},{tlwh[0]:.2f},{tlwh[1]:.2f},{tlwh[2]:.2f},{tlwh[3]:.2f},{t.score:.2f},-1,-1,-1\n"
@@ -284,6 +426,15 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
                 online_im = img_info['raw_img']
             if args.save_result:
                 vid_writer.write(online_im)
+            # cv2.imshow("online_im", online_im)
+            
+            # send to app
+            img2server = cv2.cvtColor(online_im, cv2.COLOR_BGR2RGB)
+            img_bytes = resize_img_2_bytes(img2server, resize_factor=0.5, quality=30)
+            # yeaid back to client
+            yield (b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' + img_bytes + b'\r\n\r\n')
+            
             ch = cv2.waitKey(1)
             if ch == 27 or ch == ord("q") or ch == ord("Q"):
                 break
@@ -296,7 +447,8 @@ def imageflow_demo(predictor, vis_folder, current_time, args):
         with open(res_file, 'w') as f:
             f.writelines(results)
         logger.info(f"save results to {res_file}")
-
+    print("people count: ", len(id_set))
+    
 
 def main(exp, args):
     if not args.experiment_name:
@@ -357,16 +509,22 @@ def main(exp, args):
         trt_file = None
         decoder = None
 
+    
     predictor = Predictor(model, exp, trt_file, decoder, args.device, args.fp16)
     current_time = time.localtime()
+    return predictor, vis_folder, current_time, args
     if args.demo == "image":
         image_demo(predictor, vis_folder, current_time, args)
     elif args.demo == "video" or args.demo == "webcam":
         imageflow_demo(predictor, vis_folder, current_time, args)
 
+# turn debug on
+app.debug = True
 
 if __name__ == "__main__":
     args = make_parser().parse_args()
     exp = get_exp(args.exp_file, args.name)
+    init_model_related_work(exp, args)
+    app.run(host='0.0.0.0')
+    # main(exp, args)
 
-    main(exp, args)
