@@ -11,6 +11,7 @@
 					<img src="{{ url_for('video_stream') }}" width="100%" id="image">
 
 					<script>
+						// add the event listener to the image to get the coordinates of the click
 						document.getElementById('image').addEventListener('click', function(event) {				
 							var imageRect = event.target.getBoundingClientRect();
 

@@ -19,6 +19,7 @@ from flask import Flask, render_template, Response, request
 from io import BytesIO
 from PIL import Image
 
+# stream related code starts ==============================
 
 app = Flask(
     __name__,
@@ -27,6 +28,7 @@ app = Flask(
     template_folder='./',
 )
 
+# compress image using jpeg and return bytes
 def resize_img_2_bytes(image, resize_factor, quality):
     bytes_io = BytesIO()
     img = Image.fromarray(image)
@@ -36,23 +38,26 @@ def resize_img_2_bytes(image, resize_factor, quality):
 
     return bytes_io.getvalue()
 
+# main stream page
 @app.route("/", methods=['GET'])
 def get_stream_html():
     return render_template('stream.html')
 
 banned_id_list = []
+# handle click event to ban/unban a person box
 @app.route('/handle_click', methods=['POST'])
 def handle_click():
     data = request.get_json()
     x = data['x']
     y = data['y']
-    # find the closest box
+    # find the closest box (by the bbox center) to the click point
     min_dist = 999999999
     min_id = -1
     for i, tlwh in enumerate(glo_tlws):
         print(tlwh)
         middle_x = tlwh[0] + tlwh[2] // 2
         middle_y = tlwh[1] + tlwh[3] // 2
+        # check if the click point is inside the box
         x_diff = abs(middle_x - x)
         if x_diff > tlwh[2] / 2:
             continue
@@ -64,7 +69,7 @@ def handle_click():
             min_dist = dist
             min_id = glo_ids[i]
     if min_id != -1:
-        # if in banned list, remove it
+        # if in banned list, remove it, otherwise add it
         if min_id in banned_id_list:
             banned_id_list.remove(min_id)
         else:
@@ -93,13 +98,13 @@ def init_model_related_work(exp, args):
     glo_tracker = BYTETracker(args, frame_rate=30)
 
     
-
+# run the model and return the image bytes
 def capture():
     global glo_frame_id, glo_cap, glo_timer, glo_results, glo_predictor, glo_tracker, glo_tlws, glo_ids
     while True:
         if glo_frame_id % 20 == 0:
             logger.info('Processing frame {} ({:.2f} fps)'.format(glo_frame_id, 1. / max(1e-5, glo_timer.average_time)))
-        ret_val, frame = glo_cap.read()
+        ret_val, frame = glo_cap.read()    
         if ret_val:
             outputs, img_info = glo_predictor.inference(frame, glo_timer)
             if outputs[0] is not None:
@@ -121,6 +126,7 @@ def capture():
                 
                 glo_tlws = online_tlwhs
                 glo_ids = online_ids
+                # only draw the boxes that are not banned
                 for i, tlwh in enumerate(online_tlwhs):
                     if online_ids[i] in banned_id_list:
                         continue
@@ -132,7 +138,7 @@ def capture():
             
             online_im = img_info['raw_img']
             img2server = cv2.cvtColor(online_im, cv2.COLOR_BGR2RGB)
-            img_bytes = resize_img_2_bytes(img2server, resize_factor=0.75, quality=75)
+            img_bytes = resize_img_2_bytes(img2server, resize_factor=0.9, quality=95)
             # yeaid back to client
             yield (b'--frame\r\n'
                 b'Content-Type: image/jpeg\r\n\r\n' + img_bytes + b'\r\n\r\n')
@@ -150,7 +156,7 @@ def capture():
 def video_stream():
     return Response(capture(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-
+# stream related code ends ==============================
 
 
 IMAGE_EXT = [".jpg", ".jpeg", ".webp", ".bmp", ".png"]
